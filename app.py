@@ -8,7 +8,7 @@ Run:  python app.py   (or the packaged OpenShelf.exe — see README)
 State: state.json next to this file. Nothing leaves the machine.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 import json
 import os
@@ -20,7 +20,7 @@ import time
 import traceback
 import urllib.parse
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import tkinter as tk
@@ -91,6 +91,8 @@ DEFAULT_SETTINGS = {
     "video_extensions": sorted(VIDEO_EXTS),
     "skip_dirs": sorted(SKIP_DIR_NAMES),
     "rewind_seconds": 3,
+    "sort_mode": "recent",
+    "hide_watched": False,
 }
 
 
@@ -116,12 +118,15 @@ def save_settings(settings):
 def load_state():
     st = _read_json(STATE_FILE)
     st.setdefault("history", {})
+    st.setdefault("suppress", {})  # paths whose VLC resume point is ignored (manual marks)
     return st
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps({"history": state["history"]}, indent=2, ensure_ascii=False),
-                          encoding="utf-8")
+    STATE_FILE.write_text(
+        json.dumps({"history": state["history"], "suppress": state["suppress"]},
+                   indent=2, ensure_ascii=False),
+        encoding="utf-8")
 
 
 SETTINGS = load_settings()
@@ -342,10 +347,14 @@ def build_payload():
     pos = vlc_positions()
     with STATE_LOCK:
         history = dict(STATE["history"])
+        suppress = dict(STATE["suppress"])
         folders = list(SETTINGS["folders"])
 
     def resume_of(path):
-        p = pos.get(path.lower())
+        lp = path.lower()
+        if lp in suppress:
+            return 0
+        p = pos.get(lp)
         return p[0] if p and p[0] > 0 else 0
 
     def hist_of(path):
@@ -414,7 +423,7 @@ def build_payload():
     hist_items.sort(reverse=True)
     vlc_only = sorted(
         (rank, lp) for lp, (sec, rank) in pos.items()
-        if lp in path_index and lp not in {p for _, p in hist_items}
+        if lp in path_index and lp not in suppress and lp not in {p for _, p in hist_items}
     )
     seen_titles = set()
     for lp in [p for _, p in hist_items] + [p for _, p in vlc_only]:
@@ -472,12 +481,33 @@ def launch(path, resume):
         cmd.append(f"--start-time={max(resume - rewind, 0)}")  # back up a little for context
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with STATE_LOCK:
-        h = STATE["history"].setdefault(path.lower(), {"play_count": 0, "path": path})
+        lp = path.lower()
+        h = STATE["history"].setdefault(lp, {"play_count": 0, "path": path})
         h["path"] = path
         h["play_count"] += 1
         h["last_played"] = datetime.now().isoformat(timespec="seconds")
+        STATE["suppress"].pop(lp, None)  # actually playing re-enables VLC resume tracking
         save_state(STATE)
     return {"ok": True}
+
+
+def set_watched(paths, watched):
+    """Manually flag files watched/unwatched. Both directions suppress any stale
+    VLC resume point; playing the file again lifts the suppression."""
+    with STATE_LOCK:
+        base = datetime.now()
+        for i, p in enumerate(paths):
+            lp = p.lower()
+            if watched:
+                h = STATE["history"].setdefault(lp, {"play_count": 0, "path": p})
+                h["path"] = p
+                h["manual"] = True
+                # microsecond ladder keeps mark-order == episode-order for next-up logic
+                h["last_played"] = (base + timedelta(microseconds=i)).isoformat()
+            else:
+                STATE["history"].pop(lp, None)
+            STATE["suppress"][lp] = True
+        save_state(STATE)
 
 
 # ---------- UI ----------
@@ -494,6 +524,25 @@ FONT = ("Segoe UI", 10)
 FONT_B = ("Segoe UI", 10, "bold")
 FONT_SM = ("Segoe UI", 9)
 FONT_H = ("Segoe UI", 14, "bold")
+
+
+def dark_title_bar(win):
+    """Ask DWM for a dark title bar (Windows 10 20H1+ / 11). No-op elsewhere."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        if not hwnd:
+            return
+        value = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE, pre-20H1 fallback
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                break
+    except Exception:
+        pass
 
 
 class ScrollFrame(tk.Frame):
@@ -536,7 +585,8 @@ def make_button(parent, text, cmd, primary=False):
     )
 
 
-def make_row(parent, title, sub=None, badge=None, buttons=(), on_click=None, dim_title=False):
+def make_row(parent, title, sub=None, badge=None, buttons=(), on_click=None,
+             on_context=None, dim_title=False):
     f = tk.Frame(parent, bg=CARD, padx=12, pady=8)
     f.pack(fill="x", padx=10, pady=3)
     right = tk.Frame(f, bg=CARD)
@@ -558,6 +608,9 @@ def make_row(parent, title, sub=None, badge=None, buttons=(), on_click=None, dim
         for w in [f, left] + labels:
             w.bind("<Button-1>", lambda e: on_click())
             w.configure(cursor="hand2")
+    if on_context:
+        for w in [f, left] + labels:
+            w.bind("<Button-3>", on_context)
     return f
 
 
@@ -606,7 +659,9 @@ class OpenShelf(tk.Tk):
         self.payload = None
         self._last_refresh = 0.0
         self._busy = False
+        self._show_win = None
         self.bind("<FocusIn>", self._on_focus)
+        dark_title_bar(self)
         self.refresh(force=True)
 
     # -- data --
@@ -653,6 +708,17 @@ class OpenShelf(tk.Tk):
         p = self.payload
         q = self.q.get().strip().lower()
         match = lambda s: not q or q in s.lower()
+        sort_recent = SETTINGS.get("sort_mode", "recent") == "recent"
+        hide_watched = SETTINGS.get("hide_watched", False)
+
+        if not p["folders"]:
+            for name in ("Continue", "Shows", "Movies"):
+                tab = self.tabs[name]
+                tab.clear()
+                self._empty_state(tab.inner)
+            self._render_folders(p)
+            self.status.config(text="Add a folder to get started.")
+            return
 
         cont = self.tabs["Continue"]
         cont.clear()
@@ -672,7 +738,13 @@ class OpenShelf(tk.Tk):
 
         shows_tab = self.tabs["Shows"]
         shows_tab.clear()
+        self._controls_row(shows_tab.inner, sort_recent, hide_watched)
         shown = [s for s in p["shows"] if match(s["title"])]
+        if hide_watched:
+            shown = [s for s in shown if not all(e["played"] for e in s["episodes"])]
+        shown.sort(key=lambda s: s["title"].lower())
+        if sort_recent:
+            shown.sort(key=lambda s: s["last_played"], reverse=True)
         for s in shown:
             nxt = s["next"]
             badge = None
@@ -686,13 +758,25 @@ class OpenShelf(tk.Tk):
             make_row(shows_tab.inner, s["title"], sub=sub, badge=badge,
                      buttons=[("Episodes", lambda sh=s: self.open_show(sh), False),
                               (f"▶ {nxt['label']}", lambda pl=nxt: self.play(pl), True)],
-                     on_click=lambda sh=s: self.open_show(sh))
+                     on_click=lambda sh=s: self.open_show(sh),
+                     on_context=lambda e, sh=s: self._menu(e, [
+                         ("Mark all watched",
+                          lambda: self._mark([x["path"] for x in sh["episodes"]], True)),
+                         ("Mark all unwatched",
+                          lambda: self._mark([x["path"] for x in sh["episodes"]], False)),
+                     ]))
         if not shown:
             tk.Label(shows_tab.inner, text="No shows found.", bg=BG, fg=DIM, font=FONT).pack(pady=18)
 
         movies_tab = self.tabs["Movies"]
         movies_tab.clear()
+        self._controls_row(movies_tab.inner, sort_recent, hide_watched)
         mshown = [m for m in p["movies"] if match(m["title"])]
+        if hide_watched:
+            mshown = [m for m in mshown if not (m["played"] and not m["resume"])]
+        mshown.sort(key=lambda m: (m["title"].lower(), m["year"] or ""))
+        if sort_recent:
+            mshown.sort(key=lambda m: m["last_played"], reverse=True)
         for m in mshown:
             title = m["title"]
             if m["year"]:
@@ -706,10 +790,33 @@ class OpenShelf(tk.Tk):
                      buttons=[("▶ Resume" if m["resume"] else "▶ Play",
                                lambda pl=m: self.play(pl), True)],
                      on_click=lambda pl=m: self.play(pl),
+                     on_context=lambda e, mv=m: self._menu(e, [
+                         ("Mark watched", lambda: self._mark([mv["path"]], True)),
+                         ("Mark unwatched", lambda: self._mark([mv["path"]], False)),
+                     ]),
                      dim_title=m["played"] and not m["resume"])
         if not mshown:
             tk.Label(movies_tab.inner, text="No movies found.", bg=BG, fg=DIM, font=FONT).pack(pady=18)
 
+        self._render_folders(p)
+
+        n_res = sum(1 for c in p["continue"] if c["play"]["resume"])
+        vlc_note = "" if p["vlc"] else "   ⚠ VLC NOT FOUND — playback will fail"
+        self.status.config(
+            text=f"{len(p['shows'])} shows · {len(p['movies'])} movies · "
+                 f"{n_res} resumable · positions update after you close VLC{vlc_note}")
+
+        # keep an open episode window in sync with fresh data
+        try:
+            if self._show_win and self._show_win["win"].winfo_exists():
+                fresh = next((s for s in p["shows"]
+                              if s["key"] == self._show_win["key"]), None)
+                if fresh:
+                    self._fill_show(self._show_win["sf"], fresh)
+        except tk.TclError:
+            self._show_win = None
+
+    def _render_folders(self, p):
         folders_tab = self.tabs["Folders"]
         folders_tab.clear()
         bar = tk.Frame(folders_tab.inner, bg=BG)
@@ -726,11 +833,44 @@ class OpenShelf(tk.Tk):
             make_row(folders_tab.inner, f,
                      buttons=[("Remove", lambda ff=f: self.remove_folder(ff), False)])
 
-        n_res = sum(1 for c in p["continue"] if c["play"]["resume"])
-        vlc_note = "" if p["vlc"] else "   ⚠ VLC NOT FOUND — playback will fail"
-        self.status.config(
-            text=f"{len(p['shows'])} shows · {len(p['movies'])} movies · "
-                 f"{n_res} resumable · positions update after you close VLC{vlc_note}")
+    def _controls_row(self, parent, sort_recent, hide_watched):
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill="x", padx=10, pady=(8, 2))
+        make_button(bar, "Sort: Recent" if sort_recent else "Sort: A–Z",
+                    self.toggle_sort).pack(side="left")
+        make_button(bar, "Hide watched: on" if hide_watched else "Hide watched: off",
+                    self.toggle_hide).pack(side="left", padx=(8, 0))
+
+    def _empty_state(self, parent):
+        box = tk.Frame(parent, bg=BG)
+        box.pack(expand=True, fill="both", pady=70)
+        tk.Label(box, text="No folders connected", bg=BG, fg=FG, font=FONT_H).pack(pady=(0, 6))
+        tk.Label(box, text="Point OpenShelf at the folders where your videos live.",
+                 bg=BG, fg=DIM, font=FONT).pack(pady=(0, 16))
+        make_button(box, "＋ Add a video folder", self.add_folder, True).pack()
+
+    def _menu(self, event, items):
+        m = tk.Menu(self, tearoff=0, bg=CARD2, fg=FG, activebackground=ACC,
+                    activeforeground="#141414", font=FONT_SM, bd=0)
+        for label, cmd in items:
+            m.add_command(label=label, command=cmd)
+        m.tk_popup(event.x_root, event.y_root)
+
+    def _mark(self, paths, watched):
+        set_watched(paths, watched)
+        self.refresh()
+
+    def toggle_sort(self):
+        with STATE_LOCK:
+            SETTINGS["sort_mode"] = "az" if SETTINGS.get("sort_mode", "recent") == "recent" else "recent"
+            save_settings(SETTINGS)
+        self.render()
+
+    def toggle_hide(self):
+        with STATE_LOCK:
+            SETTINGS["hide_watched"] = not SETTINGS.get("hide_watched", False)
+            save_settings(SETTINGS)
+        self.render()
 
     # -- actions --
 
@@ -752,17 +892,29 @@ class OpenShelf(tk.Tk):
                 return self.open_show(s)
 
     def open_show(self, show):
+        if self._show_win:
+            try:
+                self._show_win["win"].destroy()
+            except tk.TclError:
+                pass
         win = tk.Toplevel(self)
         win.title(show["title"])
         win.configure(bg=BG)
         win.geometry("680x560")
+        dark_title_bar(win)
         head = tk.Frame(win, bg=BG)
         head.pack(fill="x", padx=14, pady=(12, 4))
         tk.Label(head, text=show["title"], bg=BG, fg=FG, font=FONT_H).pack(side="left")
         sf = ScrollFrame(win)
         sf.pack(fill="both", expand=True, padx=6, pady=6)
+        self._show_win = {"win": win, "key": show["key"], "sf": sf}
+        self._fill_show(sf, show)
+
+    def _fill_show(self, sf, show):
+        sf.clear()
         season = None
-        for ep in show["episodes"]:
+        eps = show["episodes"]
+        for i, ep in enumerate(eps):
             if show["season_count"] > 1 and ep["season"] != season:
                 season = ep["season"]
                 tk.Label(sf.inner, text=f"SEASON {season}", bg=BG, fg=DIM,
@@ -771,6 +923,14 @@ class OpenShelf(tk.Tk):
             make_row(sf.inner, title, sub=ep["file"],
                      badge=f"⏸ {ep['resume_h']}" if ep["resume"] else None,
                      buttons=[("▶", lambda pl=ep: self.play(pl), True)],
+                     on_context=lambda e, idx=i: self._menu(e, [
+                         ("Mark watched",
+                          lambda: self._mark([eps[idx]["path"]], True)),
+                         ("Mark unwatched",
+                          lambda: self._mark([eps[idx]["path"]], False)),
+                         ("Mark watched up to here",
+                          lambda: self._mark([x["path"] for x in eps[:idx + 1]], True)),
+                     ]),
                      dim_title=ep["played"] and not ep["resume"])
 
     def add_folder(self):

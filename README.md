@@ -5,6 +5,7 @@ A tiny local "continue watching" shelf for folders of video files. Point it at t
 - **Continue watching** front and center: the thing you were last in, resumable at the exact timestamp
 - Groups `S01E02`-style filenames into shows with seasons, watched checkmarks, and a "next episode" button
 - Resume positions come from VLC itself, so they work even for stuff you watched before installing OpenShelf
+- Right-click anything to mark it watched or unwatched ("mark watched up to here" catches up a whole show); sort by recently-watched or A-to-Z, and hide finished stuff
 - One window, no server, no database, no accounts. Two small JSON files next to the app hold everything
 - Nothing ever leaves your machine
 
