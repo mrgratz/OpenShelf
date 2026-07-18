@@ -24,7 +24,7 @@ Windows SmartScreen may warn on first run because the exe is unsigned. Choose "M
 Any OS with Python 3.9+ and Tkinter (included in the standard Windows/macOS installers). No dependencies to install.
 
 ```
-git clone https://github.com/graematzek/OpenShelf
+git clone https://github.com/mrgratz/OpenShelf
 cd OpenShelf
 python app.py
 ```
