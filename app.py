@@ -8,7 +8,7 @@ Run:  python app.py   (or the packaged OpenShelf.exe — see README)
 State: state.json next to this file. Nothing leaves the machine.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import json
 import os
@@ -516,6 +516,8 @@ class ScrollFrame(tk.Frame):
         self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
 
     def _wheel(self, e):
+        if self.inner.winfo_height() <= self.canvas.winfo_height():
+            return  # content fits — nothing to scroll
         self.canvas.yview_scroll(int(-e.delta / 120) * 3, "units")
 
     def clear(self):
@@ -569,11 +571,14 @@ class OpenShelf(tk.Tk):
 
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=CARD, foreground=FG,
-                        padding=(16, 7), font=FONT)
-        style.map("TNotebook.Tab", background=[("selected", CARD2)],
-                  foreground=[("selected", ACC)])
+        style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(8, 6, 8, 0))
+        style.configure("TNotebook.Tab", background=CARD, foreground=DIM,
+                        padding=(13, 5), font=FONT, borderwidth=0)
+        style.map("TNotebook.Tab",
+                  background=[("selected", CARD2)],
+                  foreground=[("selected", ACC)],
+                  padding=[("selected", (22, 9))],
+                  expand=[("selected", (2, 2, 2, 2))])
         style.configure("Vertical.TScrollbar", background=CARD2, troughcolor=BG,
                         bordercolor=BG, arrowcolor=DIM)
 
