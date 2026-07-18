@@ -1,0 +1,11 @@
+# personal config + watch history — never ship these
+settings.json
+state.json
+last-run.log
+
+# build artifacts
+__pycache__/
+build/
+dist/
+*.spec
+*.exe
