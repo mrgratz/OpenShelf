@@ -5,6 +5,8 @@ A tiny local "continue watching" shelf for folders of video files. Point it at t
 - **Continue watching** front and center: the thing you were last in, resumable at the exact timestamp
 - Groups `S01E02`-style filenames into shows with seasons, watched checkmarks, and a "next episode" button
 - Resume positions come from VLC itself, so they work even for stuff you watched before installing OpenShelf
+- Stopped during the credits? The shelf offers the next episode, with resume still one click away
+- Per-show audio track, subtitle track and subtitle height, applied every time you press play
 - Right-click anything to mark it watched or unwatched ("mark watched up to here" catches up a whole show); sort by recently-watched or A-to-Z, and hide finished stuff
 - One window, no server, no database, no accounts. Two small JSON files next to the app hold everything
 - Nothing ever leaves your machine
@@ -44,6 +46,12 @@ VLC remembers where you stopped in each file. OpenShelf reads those saved positi
 
 The watched flag is OpenShelf's own: anything you launched through it gets tracked in `state.json`, and a show's card always offers the next unwatched episode.
 
+A saved position in the last 3 minutes, or past 90% of the file, counts as finished: the shelf moves on to the next episode and keeps "Resume" as a secondary button. OpenShelf reads the length from the file's own header (mkv and mp4), so it needs no extra tools.
+
+## Playback settings per show
+
+Open a show's episode list (Shows tab, or click a show on Continue). The bar at the top sets the audio track, the subtitle track (or Off) and the subtitle height in pixels. OpenShelf saves these per show in `state.json` and passes them to VLC on every launch. It matches tracks by language and track name in each file, so an episode with a different track order still gets the right one. Subtitle height works for text and image (Blu-ray PGS) subtitles.
+
 ## Settings
 
 `settings.json` lives next to the app and is meant to be edited (the Folders tab has an "Open settings.json" button). Save the file, hit **Rescan**, changes apply.
@@ -55,6 +63,8 @@ The watched flag is OpenShelf's own: anything you launched through it gets track
 | `video_extensions` | File types treated as video. |
 | `skip_dirs` | Directory names ignored during scans (extras, samples, ...). |
 | `rewind_seconds` | How far to back up when resuming, for context. |
+| `finish_remaining_seconds` | A position this close to the end counts as finished (default 180). |
+| `finish_percent` | ...or this much of the file watched (default 90). |
 
 `state.json` holds your watch history. Delete it to reset everything to unwatched.
 

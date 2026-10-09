@@ -8,7 +8,7 @@ Run:  python app.py   (or the packaged OpenShelf.exe — see README)
 State: state.json next to this file. Nothing leaves the machine.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import json
 import os
@@ -93,6 +93,8 @@ DEFAULT_SETTINGS = {
     "rewind_seconds": 3,
     "sort_mode": "recent",
     "hide_watched": False,
+    "finish_remaining_seconds": 180,  # this close to the end counts as finished (credits)
+    "finish_percent": 90,             # ...or this much of it watched
 }
 
 
@@ -119,12 +121,14 @@ def load_state():
     st = _read_json(STATE_FILE)
     st.setdefault("history", {})
     st.setdefault("suppress", {})  # paths whose VLC resume point is ignored (manual marks)
+    st.setdefault("show_prefs", {})  # show key -> {"audio", "sub", "sub_margin"} applied at launch
     return st
 
 
 def save_state(state):
     STATE_FILE.write_text(
-        json.dumps({"history": state["history"], "suppress": state["suppress"]},
+        json.dumps({"history": state["history"], "suppress": state["suppress"],
+                    "show_prefs": state["show_prefs"]},
                    indent=2, ensure_ascii=False),
         encoding="utf-8")
 
@@ -184,6 +188,176 @@ def vlc_positions():
             ms = 0
         out[path.lower()] = (max(ms // 1000, 0), i)
     return out
+
+
+# ---------- media probe (duration + tracks, stdlib) ----------
+
+LANG_NAMES = {
+    "eng": "English", "en": "English", "jpn": "Japanese", "ja": "Japanese",
+    "spa": "Spanish", "es": "Spanish", "fre": "French", "fra": "French", "fr": "French",
+    "ger": "German", "deu": "German", "de": "German", "ita": "Italian", "it": "Italian",
+    "por": "Portuguese", "pt": "Portuguese", "kor": "Korean", "ko": "Korean",
+    "chi": "Chinese", "zho": "Chinese", "zh": "Chinese", "rus": "Russian", "ru": "Russian",
+    "und": "Unknown",
+}
+
+_EBML_MASTERS = {0x18538067, 0x1549A966, 0x1654AE6B, 0xAE}  # Segment, Info, Tracks, TrackEntry
+
+
+def _ebml_id(f):
+    b = f.read(1)
+    if not b:
+        return None
+    n = next((i for i in range(4) if b[0] & (0x80 >> i)), None)
+    if n is None:
+        return None
+    return int.from_bytes(b + f.read(n), "big")
+
+
+def _ebml_size(f):
+    b = f.read(1)
+    if not b:
+        return None
+    n = next((i for i in range(8) if b[0] & (0x80 >> i)), None)
+    if n is None:
+        return None
+    val = b[0] & (0xFF >> (n + 1))
+    for c in f.read(n):
+        val = (val << 8) | c
+    return -1 if val == (1 << (7 * (n + 1))) - 1 else val  # -1 = unknown size
+
+
+def _probe_mkv(path):
+    import io
+    import struct
+    out = {"duration": 0, "tracks": []}
+    with open(path, "rb") as f:
+        if _ebml_id(f) != 0x1A45DFA3:
+            return None
+        f.seek(_ebml_size(f), 1)
+        if _ebml_id(f) != 0x18538067:
+            return None
+        _ebml_size(f)
+        scale, dur, got = 1_000_000, 0.0, set()
+        while len(got) < 2 and f.tell() < 64 * 1024 * 1024:
+            eid = _ebml_id(f)
+            size = _ebml_size(f)
+            if eid is None or size is None or size < 0 or eid == 0x1F43B675:  # Cluster: headers are done
+                break
+            if eid not in (0x1549A966, 0x1654AE6B):
+                f.seek(size, 1)
+                continue
+            got.add(eid)
+            body = io.BytesIO(f.read(size))
+            while True:
+                cid = _ebml_id(body)
+                csize = _ebml_size(body)
+                if cid is None or csize is None or csize < 0:
+                    break
+                data = body.read(csize)
+                if eid == 0x1549A966:  # Info
+                    if cid == 0x2AD7B1:
+                        scale = int.from_bytes(data, "big")
+                    elif cid == 0x4489:
+                        dur = struct.unpack(">f" if len(data) == 4 else ">d", data)[0]
+                elif cid == 0xAE:  # TrackEntry
+                    t = {"type": 0, "lang": "eng", "name": "", "default": True, "forced": False}
+                    te = io.BytesIO(data)
+                    while True:
+                        tid = _ebml_id(te)
+                        tsize = _ebml_size(te)
+                        if tid is None or tsize is None or tsize < 0:
+                            break
+                        v = te.read(tsize)
+                        if tid == 0x83:
+                            t["type"] = int.from_bytes(v, "big")
+                        elif tid == 0x22B59C:
+                            t["lang"] = v.decode("utf-8", "replace").strip("\0") or "eng"
+                        elif tid == 0x536E:
+                            t["name"] = v.decode("utf-8", "replace").strip("\0")
+                        elif tid == 0x88:
+                            t["default"] = bool(int.from_bytes(v, "big"))
+                        elif tid == 0x55AA:
+                            t["forced"] = bool(int.from_bytes(v, "big"))
+                    kind = {2: "audio", 0x11: "sub"}.get(t["type"])
+                    if kind:
+                        out["tracks"].append({"kind": kind, "lang": t["lang"], "name": t["name"],
+                                              "default": t["default"], "forced": t["forced"]})
+        out["duration"] = int(dur * scale / 1e9)
+    return out
+
+
+def _probe_mp4(path):
+    """Duration from moov/mvhd. Track listing is mkv-only; mp4 falls back to language options."""
+    import struct
+    with open(path, "rb") as f:
+        end = os.fstat(f.fileno()).st_size
+        while f.tell() < end:
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                return None
+            size, typ = struct.unpack(">I4s", hdr)
+            if size == 1:
+                size = struct.unpack(">Q", f.read(8))[0] - 16
+            else:
+                size = (end - f.tell()) if size == 0 else size - 8
+            if typ != b"moov":
+                f.seek(size, 1)
+                continue
+            moov = f.read(min(size, 64 * 1024 * 1024))
+            i = moov.find(b"mvhd")
+            if i < 0:
+                return None
+            body = moov[i + 4:]
+            if body[0] == 1:
+                timescale, dur = struct.unpack(">IQ", body[20:32])
+            else:
+                timescale, dur = struct.unpack(">II", body[12:20])
+            return {"duration": int(dur / timescale) if timescale else 0, "tracks": []}
+    return None
+
+
+PROBE_CACHE = {}
+
+
+def probe(path):
+    """{'duration': seconds, 'tracks': [...]} or None. Reads only container headers; cached."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path.lower(), st.st_size, int(st.st_mtime))
+    if key in PROBE_CACHE:
+        return PROBE_CACHE[key]
+    ext = Path(path).suffix.lower()
+    try:
+        info = (_probe_mkv(path) if ext in (".mkv", ".webm")
+                else _probe_mp4(path) if ext in (".mp4", ".m4v", ".mov") else None)
+    except Exception:
+        info = None
+    PROBE_CACHE[key] = info
+    return info
+
+
+def near_end(path, resume):
+    """True when the saved position is in the credits: few minutes left or most of it watched."""
+    if not resume:
+        return False
+    info = probe(path)
+    dur = info["duration"] if info else 0
+    if dur <= 0 or resume > dur:
+        return False
+    left = dur - resume
+    return (left <= int(SETTINGS.get("finish_remaining_seconds", 180))
+            or resume * 100 >= dur * int(SETTINGS.get("finish_percent", 90)))
+
+
+def track_label(t, i):
+    lang = LANG_NAMES.get(t["lang"].lower(), t["lang"])
+    name = t["name"] or lang
+    if lang.lower() not in name.lower():
+        name += f" ({lang})"
+    return f"{i + 1}. {name}"
 
 
 # ---------- scanning / grouping ----------
@@ -375,12 +549,12 @@ def build_payload():
                 "label": f"S{e['season']:02d}E{e['ep']:02d}",
                 "file": e["file"], "path": e["path"],
                 "resume": r, "resume_h": fmt_time(r) if r else None,
-                "played": bool(h),
+                "played": bool(h), "finished": near_end(e["path"], r),
             })
         next_up = eps[0]
         if last_played_idx is not None:
             cur = eps[last_played_idx]
-            if cur["resume"]:
+            if cur["resume"] and not cur["finished"]:
                 next_up = cur
             elif last_played_idx + 1 < len(eps):
                 next_up = eps[last_played_idx + 1]
@@ -403,6 +577,7 @@ def build_payload():
             "kind": "movie", "title": m["title"], "year": m["year"], "tag": m["tag"],
             "path": m["path"], "resume": r, "resume_h": fmt_time(r) if r else None,
             "played": bool(h), "last_played": h["last_played"] if h else "",
+            "finished": near_end(m["path"], r),
         })
     out_movies.sort(key=lambda m: (m["title"].lower(), m["year"] or ""))
 
@@ -439,18 +614,28 @@ def build_payload():
                 continue
             used.add(s["key"])
             used.add(lp)
-            cont.append({
-                "kind": "show", "title": s["title"], "key": s["key"],
-                "sub": (f"Resume {item['label']} · {item['resume_h']}" if item["resume"]
-                        else f"Watched {item['label']}"),
-                "play": item if item["resume"] else _next_after(s, item),
-            })
+            nxt = _next_after(s, item)
+            alt = None
+            if item["resume"] and item["finished"] and nxt is not item:
+                sub = f"Finished {item['label']} · up next {nxt['label']}"
+                play, alt = nxt, item
+            elif item["resume"]:
+                sub, play = f"Resume {item['label']} · {item['resume_h']}", item
+            else:
+                sub, play = f"Watched {item['label']}", nxt
+            cont.append({"kind": "show", "title": s["title"], "key": s["key"],
+                         "sub": sub, "play": play, "alt": alt})
         else:
             used.add(lp)
+            if item["resume"] and item["finished"]:
+                sub = f"Finished · stopped at {item['resume_h']}"
+            elif item["resume"]:
+                sub = f"Resume · {item['resume_h']}"
+            else:
+                sub = "Watched"
             cont.append({
                 "kind": "movie", "title": item["title"] + (f" ({item['year']})" if item["year"] else ""),
-                "sub": f"Resume · {item['resume_h']}" if item["resume"] else "Watched",
-                "play": item,
+                "sub": sub, "play": item, "alt": None,
             })
         if len(cont) >= 12:
             break
@@ -469,14 +654,52 @@ def _next_after(show, ep):
 
 # ---------- playback ----------
 
-def launch(path, resume):
+def _pick_track(tracks, want):
+    """Index (0-based, within its kind) of the saved track in this file, or None."""
+    for test in (lambda t: t["lang"] == want.get("lang") and t["name"] == want.get("name"),
+                 lambda t: want.get("name") and t["name"] == want.get("name")):
+        for i, t in enumerate(tracks):
+            if test(t):
+                return i
+    i = want.get("index")
+    if isinstance(i, int) and 0 <= i < len(tracks):
+        return i
+    return None
+
+
+def playback_args(path, prefs):
+    if not prefs:
+        return []
+    info = probe(path) or {"tracks": []}
+    args = []
+    for kind in ("audio", "sub"):
+        want = prefs.get(kind)
+        if not want:
+            continue
+        if want == "off":
+            args.append("--no-spu")
+            continue
+        idx = _pick_track([t for t in info["tracks"] if t["kind"] == kind], want)
+        if idx is not None:
+            args.append(f"--{kind}-track={idx}")
+        elif want.get("lang"):
+            args.append(f"--{kind}-language={want['lang']}")
+    margin = int(prefs.get("sub_margin") or 0)
+    if margin:
+        args.append(f"--sub-margin={margin}")
+    return args
+
+
+def launch(path, resume, show_key=None):
     if not os.path.exists(path):
         return {"ok": False, "error": "File not found:\n" + path}
     vlc = find_vlc()
     if not vlc:
         return {"ok": False, "error": "VLC not found — install VLC, or set \"vlc_path\" in settings.json"}
     rewind = int(SETTINGS.get("rewind_seconds", 3))
-    cmd = [vlc, path]
+    with STATE_LOCK:
+        prefs = dict(STATE["show_prefs"].get(show_key, {})) if show_key else {}
+    cmd = [vlc, path] + playback_args(path, prefs)
     if resume and resume > rewind:
         cmd.append(f"--start-time={max(resume - rewind, 0)}")  # back up a little for context
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -569,10 +792,20 @@ class ScrollFrame(tk.Frame):
             return  # content fits — nothing to scroll
         self.canvas.yview_scroll(int(-e.delta / 120) * 3, "units")
 
-    def clear(self):
+    def clear(self, reset=True):
+        pos = self.canvas.yview()[0]
         for c in self.inner.winfo_children():
             c.destroy()
-        self.canvas.yview_moveto(0)
+        if reset:
+            self.canvas.yview_moveto(0)
+        else:  # re-render of the same view: stay where the user was
+            self.after(30, lambda: self.canvas.yview_moveto(pos))
+
+    def scroll_to(self, widget):
+        self.update_idletasks()
+        h = self.inner.winfo_height()
+        if h > self.canvas.winfo_height():
+            self.canvas.yview_moveto(max(widget.winfo_y() - 8, 0) / h)
 
 
 def make_button(parent, text, cmd, primary=False):
@@ -634,6 +867,15 @@ class OpenShelf(tk.Tk):
                   expand=[("selected", (2, 2, 2, 2))])
         style.configure("Vertical.TScrollbar", background=CARD2, troughcolor=BG,
                         bordercolor=BG, arrowcolor=DIM)
+        style.configure("TCombobox", fieldbackground=CARD2, background=CARD2, foreground=FG,
+                        arrowcolor=FG, bordercolor=CARD2, lightcolor=CARD2, darkcolor=CARD2)
+        style.map("TCombobox", fieldbackground=[("readonly", CARD2)],
+                  foreground=[("readonly", FG)], selectbackground=[("readonly", CARD2)],
+                  selectforeground=[("readonly", FG)])
+        self.option_add("*TCombobox*Listbox.background", CARD2)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACC)
+        self.option_add("*TCombobox*Listbox.selectForeground", "#141414")
 
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=14, pady=(12, 6))
@@ -659,7 +901,9 @@ class OpenShelf(tk.Tk):
         self.payload = None
         self._last_refresh = 0.0
         self._busy = False
-        self._show_win = None
+        self._expanded = set()   # show keys whose episode list is open inline
+        self._scroll_to = None   # show key to bring into view after the next render
+        self._last_q = ""
         self.bind("<FocusIn>", self._on_focus)
         dark_title_bar(self)
         self.refresh(force=True)
@@ -707,6 +951,8 @@ class OpenShelf(tk.Tk):
             return
         p = self.payload
         q = self.q.get().strip().lower()
+        reset = q != self._last_q
+        self._last_q = q
         match = lambda s: not q or q in s.lower()
         sort_recent = SETTINGS.get("sort_mode", "recent") == "recent"
         hide_watched = SETTINGS.get("hide_watched", False)
@@ -714,34 +960,39 @@ class OpenShelf(tk.Tk):
         if not p["folders"]:
             for name in ("Continue", "Shows", "Movies"):
                 tab = self.tabs[name]
-                tab.clear()
+                tab.clear(reset)
                 self._empty_state(tab.inner)
             self._render_folders(p)
             self.status.config(text="Add a folder to get started.")
             return
 
         cont = self.tabs["Continue"]
-        cont.clear()
+        cont.clear(reset)
         items = [c for c in p["continue"] if match(c["title"])]
         for c in items:
-            play = c["play"]
-            btn_label = "▶ Resume" if play["resume"] else "▶ Play"
+            play, alt, key = c["play"], c.get("alt"), c.get("key")
+            resuming = play["resume"] and not play.get("finished")
+            btn_label = "▶ Resume" if resuming else ("▶ Next" if alt else "▶ Play")
             if c["kind"] == "show":
                 btn_label += " " + play["label"]
-            make_row(cont.inner, c["title"], sub=c["sub"],
-                     buttons=[(btn_label, lambda pl=play: self.play(pl), True)],
-                     on_click=(lambda k=c.get("key"): self.open_show_by_key(k)) if c["kind"] == "show" else
+            buttons = [(btn_label, lambda pl=play, k=key: self.play(pl, k), True)]
+            if alt:
+                buttons.append((f"Resume {alt['label']} · {alt['resume_h']}",
+                                lambda pl=alt, k=key: self.play(pl, k), False))
+            make_row(cont.inner, c["title"], sub=c["sub"], buttons=buttons,
+                     on_click=(lambda k=key: self.expand_show(k)) if c["kind"] == "show" else
                               (lambda pl=play: self.play(pl)))
         if not items:
             tk.Label(cont.inner, text="Nothing yet — play something.",
                      bg=BG, fg=DIM, font=FONT).pack(pady=18)
 
         shows_tab = self.tabs["Shows"]
-        shows_tab.clear()
+        shows_tab.clear(reset and not self._scroll_to)
         self._controls_row(shows_tab.inner, sort_recent, hide_watched)
         shown = [s for s in p["shows"] if match(s["title"])]
         if hide_watched:
-            shown = [s for s in shown if not all(e["played"] for e in s["episodes"])]
+            shown = [s for s in shown
+                     if not all(e["played"] and (not e["resume"] or e["finished"]) for e in s["episodes"])]
         shown.sort(key=lambda s: s["title"].lower())
         if sort_recent:
             shown.sort(key=lambda s: s["last_played"], reverse=True)
@@ -755,25 +1006,32 @@ class OpenShelf(tk.Tk):
             sub = f"{s['ep_count']} episode{'s' if s['ep_count'] > 1 else ''}"
             if s["season_count"] > 1:
                 sub += f" · {s['season_count']} seasons"
-            make_row(shows_tab.inner, s["title"], sub=sub, badge=badge,
-                     buttons=[("Episodes", lambda sh=s: self.open_show(sh), False),
-                              (f"▶ {nxt['label']}", lambda pl=nxt: self.play(pl), True)],
-                     on_click=lambda sh=s: self.open_show(sh),
+            open_ = s["key"] in self._expanded
+            row = make_row(shows_tab.inner, s["title"], sub=sub, badge=badge,
+                     buttons=[("Episodes ▴" if open_ else "Episodes ▾",
+                               lambda k=s["key"]: self.toggle_show(k), False),
+                              (f"▶ {nxt['label']}", lambda pl=nxt, k=s["key"]: self.play(pl, k), True)],
+                     on_click=lambda k=s["key"]: self.toggle_show(k),
                      on_context=lambda e, sh=s: self._menu(e, [
                          ("Mark all watched",
                           lambda: self._mark([x["path"] for x in sh["episodes"]], True)),
                          ("Mark all unwatched",
                           lambda: self._mark([x["path"] for x in sh["episodes"]], False)),
                      ]))
+            if open_:
+                self._show_panel(shows_tab.inner, s)
+            if self._scroll_to == s["key"]:
+                self.after(60, lambda r=row: shows_tab.scroll_to(r))
+        self._scroll_to = None
         if not shown:
             tk.Label(shows_tab.inner, text="No shows found.", bg=BG, fg=DIM, font=FONT).pack(pady=18)
 
         movies_tab = self.tabs["Movies"]
-        movies_tab.clear()
+        movies_tab.clear(reset)
         self._controls_row(movies_tab.inner, sort_recent, hide_watched)
         mshown = [m for m in p["movies"] if match(m["title"])]
         if hide_watched:
-            mshown = [m for m in mshown if not (m["played"] and not m["resume"])]
+            mshown = [m for m in mshown if not (m["played"] and (not m["resume"] or m["finished"]))]
         mshown.sort(key=lambda m: (m["title"].lower(), m["year"] or ""))
         if sort_recent:
             mshown.sort(key=lambda m: m["last_played"], reverse=True)
@@ -783,7 +1041,8 @@ class OpenShelf(tk.Tk):
                 title += f" ({m['year']})"
             if m["tag"]:
                 title += f"  [{m['tag']}]"
-            if m["played"] and not m["resume"]:
+            done = m["played"] and (not m["resume"] or m["finished"])
+            if done:
                 title += "  ✓"
             make_row(movies_tab.inner, title,
                      badge=f"⏸ {m['resume_h']}" if m["resume"] else None,
@@ -794,7 +1053,7 @@ class OpenShelf(tk.Tk):
                          ("Mark watched", lambda: self._mark([mv["path"]], True)),
                          ("Mark unwatched", lambda: self._mark([mv["path"]], False)),
                      ]),
-                     dim_title=m["played"] and not m["resume"])
+                     dim_title=done)
         if not mshown:
             tk.Label(movies_tab.inner, text="No movies found.", bg=BG, fg=DIM, font=FONT).pack(pady=18)
 
@@ -806,19 +1065,10 @@ class OpenShelf(tk.Tk):
             text=f"{len(p['shows'])} shows · {len(p['movies'])} movies · "
                  f"{n_res} resumable · positions update after you close VLC{vlc_note}")
 
-        # keep an open episode window in sync with fresh data
-        try:
-            if self._show_win and self._show_win["win"].winfo_exists():
-                fresh = next((s for s in p["shows"]
-                              if s["key"] == self._show_win["key"]), None)
-                if fresh:
-                    self._fill_show(self._show_win["sf"], fresh)
-        except tk.TclError:
-            self._show_win = None
 
     def _render_folders(self, p):
         folders_tab = self.tabs["Folders"]
-        folders_tab.clear()
+        folders_tab.clear(False)
         bar = tk.Frame(folders_tab.inner, bg=BG)
         bar.pack(fill="x", padx=10, pady=(10, 4))
         make_button(bar, "+ Add folder…", self.add_folder, True).pack(side="left")
@@ -874,8 +1124,8 @@ class OpenShelf(tk.Tk):
 
     # -- actions --
 
-    def play(self, item):
-        res = launch(item["path"], item.get("resume") or 0)
+    def play(self, item, show_key=None):
+        res = launch(item["path"], item.get("resume") or 0, show_key)
         if not res["ok"]:
             messagebox.showerror("OpenShelf", res["error"])
             return
@@ -884,45 +1134,41 @@ class OpenShelf(tk.Tk):
         # pick up the new played-flag; VLC position lands later (on focus return)
         self.after(1200, lambda: self.refresh())
 
-    def open_show_by_key(self, key):
+    def toggle_show(self, key):
+        self._expanded.symmetric_difference_update({key})
+        self.render()
+
+    def expand_show(self, key):
+        """Continue card click: open that show's episode list in the Shows tab."""
         if not key or not self.payload:
             return
-        for s in self.payload["shows"]:
-            if s["key"] == key:
-                return self.open_show(s)
+        show = next((s for s in self.payload["shows"] if s["key"] == key), None)
+        if not show:
+            return
+        self._expanded = {key}
+        self._scroll_to = key
+        self.nb.select(self.tabs["Shows"])
+        if self.q.get().strip() and self.q.get().strip().lower() not in show["title"].lower():
+            self.q.set("")  # trace re-renders
+        else:
+            self.render()
 
-    def open_show(self, show):
-        if self._show_win:
-            try:
-                self._show_win["win"].destroy()
-            except tk.TclError:
-                pass
-        win = tk.Toplevel(self)
-        win.title(show["title"])
-        win.configure(bg=BG)
-        win.geometry("680x560")
-        dark_title_bar(win)
-        head = tk.Frame(win, bg=BG)
-        head.pack(fill="x", padx=14, pady=(12, 4))
-        tk.Label(head, text=show["title"], bg=BG, fg=FG, font=FONT_H).pack(side="left")
-        sf = ScrollFrame(win)
-        sf.pack(fill="both", expand=True, padx=6, pady=6)
-        self._show_win = {"win": win, "key": show["key"], "sf": sf}
-        self._fill_show(sf, show)
-
-    def _fill_show(self, sf, show):
-        sf.clear()
-        season = None
-        eps = show["episodes"]
+    def _show_panel(self, parent, show):
+        panel = tk.Frame(parent, bg=BG)
+        panel.pack(fill="x", padx=(30, 0), pady=(0, 8))
+        self._prefs_row(panel, show)
+        eps, season = show["episodes"], None
         for i, ep in enumerate(eps):
             if show["season_count"] > 1 and ep["season"] != season:
                 season = ep["season"]
-                tk.Label(sf.inner, text=f"SEASON {season}", bg=BG, fg=DIM,
-                         font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=14, pady=(12, 2))
-            title = ep["label"] + ("  ✓" if ep["played"] else "")
-            make_row(sf.inner, title, sub=ep["file"],
-                     badge=f"⏸ {ep['resume_h']}" if ep["resume"] else None,
-                     buttons=[("▶", lambda pl=ep: self.play(pl), True)],
+                tk.Label(panel, text=f"SEASON {season}", bg=BG, fg=DIM,
+                         font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
+            done = ep["played"] and (not ep["resume"] or ep["finished"])
+            badge = None
+            if ep["resume"]:
+                badge = f"⏸ {ep['resume_h']}" + (" · finished" if ep["finished"] else "")
+            make_row(panel, ep["label"] + ("  ✓" if done else ""), sub=ep["file"], badge=badge,
+                     buttons=[("▶", lambda pl=ep, k=show["key"]: self.play(pl, k), True)],
                      on_context=lambda e, idx=i: self._menu(e, [
                          ("Mark watched",
                           lambda: self._mark([eps[idx]["path"]], True)),
@@ -931,7 +1177,88 @@ class OpenShelf(tk.Tk):
                          ("Mark watched up to here",
                           lambda: self._mark([x["path"] for x in eps[:idx + 1]], True)),
                      ]),
-                     dim_title=ep["played"] and not ep["resume"])
+                     dim_title=done)
+
+    def _prefs_row(self, parent, show):
+        """Audio / subtitle track + subtitle height, saved per show, applied on every launch."""
+        key = show["key"]
+        sample = next((probe(e["path"]) for e in [show["next"]] + show["episodes"]
+                       if probe(e["path"])), None)
+        tracks = sample["tracks"] if sample else []
+        with STATE_LOCK:
+            prefs = dict(STATE["show_prefs"].get(key, {}))
+
+        box = tk.Frame(parent, bg=CARD2, padx=12, pady=8)
+        box.pack(fill="x", padx=10, pady=(2, 4))
+
+        def save(field, value):
+            with STATE_LOCK:
+                cur = STATE["show_prefs"].setdefault(key, {})
+                if value in (None, 0):
+                    cur.pop(field, None)
+                else:
+                    cur[field] = value
+                if not cur:
+                    STATE["show_prefs"].pop(key, None)
+                save_state(STATE)
+            self.status.config(text=f"Saved for {show['title']} — applies next time you press play")
+
+        for kind, label in (("audio", "Audio"), ("sub", "Subtitles")):
+            ktracks = [t for t in tracks if t["kind"] == kind]
+            labels = [track_label(t, i) for i, t in enumerate(ktracks)]
+            values = ["VLC default"] + (["Off"] if kind == "sub" else []) + labels
+            want = prefs.get(kind)
+            if want == "off":
+                current = "Off"
+            elif want:
+                idx = _pick_track(ktracks, want)
+                current = labels[idx] if idx is not None else f"{LANG_NAMES.get(want.get('lang', ''), want.get('lang', '?'))} (saved)"
+                if current not in values:
+                    values.append(current)
+            else:
+                current = "VLC default"
+            tk.Label(box, text=label, bg=CARD2, fg=DIM, font=FONT_SM).pack(side="left")
+            var = tk.StringVar(value=current)
+            cb = ttk.Combobox(box, textvariable=var, values=values, state="readonly",
+                              width=max(14, min(30, max(len(v) for v in values) + 1)), font=FONT_SM)
+            cb.pack(side="left", padx=(6, 16))
+
+            def on_pick(_e, kind=kind, var=var, ktracks=ktracks, labels=labels):
+                v = var.get()
+                if v == "VLC default":
+                    save(kind, None)
+                elif v == "Off":
+                    save(kind, "off")
+                elif v in labels:
+                    i = labels.index(v)
+                    t = ktracks[i]
+                    save(kind, {"lang": t["lang"], "name": t["name"], "index": i})
+                cb_ref = _e.widget
+                cb_ref.selection_clear()
+            cb.bind("<<ComboboxSelected>>", on_pick)
+
+        tk.Label(box, text="Subtitle height", bg=CARD2, fg=DIM, font=FONT_SM).pack(side="left")
+        hv = tk.StringVar(value=str(int(prefs.get("sub_margin") or 0)))
+        spin = tk.Spinbox(box, from_=0, to=600, increment=20, textvariable=hv, width=5,
+                          bg=CARD, fg=FG, buttonbackground=CARD2, insertbackground=FG,
+                          relief="flat", font=FONT_SM, justify="center")
+        spin.pack(side="left", padx=(6, 4))
+        tk.Label(box, text="px up", bg=CARD2, fg=DIM, font=FONT_SM).pack(side="left")
+
+        def save_height(*_):
+            try:
+                v = max(0, min(600, int(hv.get())))
+            except ValueError:
+                return
+            if v != int(prefs.get("sub_margin") or 0):
+                prefs["sub_margin"] = v
+                save("sub_margin", v)
+        spin.configure(command=save_height)
+        spin.bind("<Return>", save_height)
+        spin.bind("<FocusOut>", save_height)
+        if not tracks:
+            tk.Label(box, text="  (no track list for this format — VLC picks)", bg=CARD2, fg=DIM,
+                     font=FONT_SM).pack(side="left")
 
     def add_folder(self):
         d = filedialog.askdirectory(title="Add a video folder")
