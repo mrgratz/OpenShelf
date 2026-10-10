@@ -8,7 +8,7 @@ Run:  python app.py   (or the packaged OpenShelf.exe — see README)
 State: state.json next to this file. Nothing leaves the machine.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import json
 import os
@@ -523,10 +523,40 @@ def _ini_mtime():
         return None
 
 
+def _pick_up_queued(pos, ini_at):
+    """If VLC moved on to the queued next episode (N key, or the first one ended), record it
+    as played so the shelf follows. Evidence: VLC saved after the launch and the queued file
+    is more recent in VLC's own recents list than the launched one."""
+    if not ini_at:
+        return
+    with STATE_LOCK:
+        hist = STATE["history"]
+        lp = max(hist, key=lambda k: hist[k].get("last_played", ""), default=None)
+        h = hist.get(lp)
+        if not h or not h.get("queued"):
+            return
+        try:
+            launched = datetime.fromisoformat(h["last_played"])
+        except (KeyError, ValueError):
+            return
+        if ini_at <= launched:
+            return  # VLC hasn't saved since the launch: still playing, or nothing to see yet
+        q = h.pop("queued")
+        ql = q.lower()
+        if ql in pos and (lp not in pos or pos[ql][1] < pos[lp][1]):
+            n = hist.setdefault(ql, {"play_count": 0, "path": q})
+            n["path"] = q
+            n["play_count"] += 1
+            n["last_played"] = (max(ini_at, launched) + timedelta(seconds=1)).isoformat(timespec="seconds")
+            STATE["suppress"].pop(ql, None)
+        save_state(STATE)
+
+
 def build_payload():
     shows, movies = get_library()
     pos = vlc_positions()
     ini_at = _ini_mtime()
+    _pick_up_queued(pos, ini_at)
     with STATE_LOCK:
         history = {k: dict(v) for k, v in STATE["history"].items()}
         suppress = dict(STATE["suppress"])
@@ -749,7 +779,7 @@ def playback_args(path, prefs):
     return args
 
 
-def launch(path, resume, show_key=None):
+def launch(path, resume, show_key=None, next_path=None):
     if not os.path.exists(path):
         return {"ok": False, "error": "File not found:\n" + path}
     vlc = find_vlc()
@@ -758,9 +788,12 @@ def launch(path, resume, show_key=None):
     rewind = int(SETTINGS.get("rewind_seconds", 3))
     with STATE_LOCK:
         prefs = dict(STATE["show_prefs"].get(show_key, {})) if show_key else {}
-    cmd = [vlc, path] + playback_args(path, prefs)
+    cmd = [vlc] + playback_args(path, prefs) + [path]
     if resume and resume > rewind:
-        cmd.append(f"--start-time={max(resume - rewind, 0)}")  # back up a little for context
+        # item option (":"), so it only applies to this file, not the queued next episode
+        cmd.append(f":start-time={max(resume - rewind, 0)}")  # back up a little for context
+    if next_path and os.path.exists(next_path):
+        cmd.append(next_path)  # queued behind it: VLC's N key / next button plays it
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with STATE_LOCK:
         lp = path.lower()
@@ -768,6 +801,10 @@ def launch(path, resume, show_key=None):
         h["path"] = path
         h["play_count"] += 1
         h["last_played"] = datetime.now().isoformat(timespec="seconds")
+        if next_path:
+            h["queued"] = next_path
+        else:
+            h.pop("queued", None)
         STATE["suppress"].pop(lp, None)  # actually playing re-enables VLC resume tracking
         save_state(STATE)
     return {"ok": True}
@@ -1184,7 +1221,13 @@ class OpenShelf(tk.Tk):
     # -- actions --
 
     def play(self, item, show_key=None):
-        res = launch(item["path"], item.get("resume") or 0, show_key)
+        nxt = None
+        show = next((s for s in (self.payload or {}).get("shows", []) if s["key"] == show_key), None)
+        if show:
+            after = _next_after(show, item)
+            if after["path"] != item["path"]:
+                nxt = after["path"]
+        res = launch(item["path"], item.get("resume") or 0, show_key, nxt)
         if not res["ok"]:
             messagebox.showerror("OpenShelf", res["error"])
             return
