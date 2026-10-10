@@ -516,13 +516,57 @@ def fmt_time(sec):
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+def _ini_mtime():
+    try:
+        return datetime.fromtimestamp(_vlc_ini_path().stat().st_mtime)
+    except OSError:
+        return None
+
+
 def build_payload():
     shows, movies = get_library()
     pos = vlc_positions()
+    ini_at = _ini_mtime()
     with STATE_LOCK:
-        history = dict(STATE["history"])
+        history = {k: dict(v) for k, v in STATE["history"].items()}
         suppress = dict(STATE["suppress"])
         folders = list(SETTINGS["folders"])
+    latest = max(history, key=lambda k: history[k].get("last_played", ""), default=None)
+
+    def playing(path):
+        """Launched after VLC last saved anything: VLC is (probably) still open on it."""
+        h = history.get(path.lower())
+        if not h or path.lower() != latest or not ini_at:
+            return False
+        try:
+            return datetime.fromisoformat(h["last_played"]) > ini_at
+        except (KeyError, ValueError):
+            return False
+
+    newly_done = []
+
+    def done_of(path, r):
+        """Watched for real: marked by hand, stopped in the credits, or played through.
+        Opening a file for a few seconds is not watching it."""
+        lp = path.lower()
+        h = history.get(lp)
+        if not h:
+            return False
+        if h.get("manual") or h.get("finished"):
+            return True
+        fin = near_end(path, r)
+        if not fin and not r and lp == latest and lp in pos and ini_at:
+            # VLC drops the resume point when a file plays to the end; time the session instead
+            try:
+                ran = (ini_at - datetime.fromisoformat(h["last_played"])).total_seconds()
+                info = probe(path)
+                fin = bool(info and info["duration"] and ran >= 0.8 * info["duration"])
+            except (KeyError, ValueError):
+                pass
+        if fin:
+            h["finished"] = True
+            newly_done.append(lp)
+        return fin
 
     def resume_of(path):
         lp = path.lower()
@@ -550,11 +594,12 @@ def build_payload():
                 "file": e["file"], "path": e["path"],
                 "resume": r, "resume_h": fmt_time(r) if r else None,
                 "played": bool(h), "finished": near_end(e["path"], r),
+                "done": done_of(e["path"], r), "playing": playing(e["path"]),
             })
         next_up = eps[0]
         if last_played_idx is not None:
             cur = eps[last_played_idx]
-            if cur["resume"] and not cur["finished"]:
+            if not cur["done"]:
                 next_up = cur
             elif last_played_idx + 1 < len(eps):
                 next_up = eps[last_played_idx + 1]
@@ -577,7 +622,8 @@ def build_payload():
             "kind": "movie", "title": m["title"], "year": m["year"], "tag": m["tag"],
             "path": m["path"], "resume": r, "resume_h": fmt_time(r) if r else None,
             "played": bool(h), "last_played": h["last_played"] if h else "",
-            "finished": near_end(m["path"], r),
+            "finished": near_end(m["path"], r), "done": done_of(m["path"], r),
+            "playing": playing(m["path"]),
         })
     out_movies.sort(key=lambda m: (m["title"].lower(), m["year"] or ""))
 
@@ -616,19 +662,25 @@ def build_payload():
             used.add(lp)
             nxt = _next_after(s, item)
             alt = None
-            if item["resume"] and item["finished"] and nxt is not item:
-                sub = f"Finished {item['label']} · up next {nxt['label']}"
-                play, alt = nxt, item
+            if item["playing"]:
+                sub, play = f"Watching {item['label']} now · position saves when VLC closes", item
+            elif item["done"] and nxt is not item:
+                sub, play = f"Finished {item['label']} · up next {nxt['label']}", nxt
+                alt = item if item["resume"] else None
             elif item["resume"]:
                 sub, play = f"Resume {item['label']} · {item['resume_h']}", item
+            elif item["done"]:
+                sub, play = f"Watched {item['label']}", item
             else:
-                sub, play = f"Watched {item['label']}", nxt
+                sub, play = f"Started {item['label']}", item
             cont.append({"kind": "show", "title": s["title"], "key": s["key"],
                          "sub": sub, "play": play, "alt": alt})
         else:
             used.add(lp)
-            if item["resume"] and item["finished"]:
-                sub = f"Finished · stopped at {item['resume_h']}"
+            if item["playing"]:
+                sub = "Watching now · position saves when VLC closes"
+            elif item["done"]:
+                sub = f"Finished · stopped at {item['resume_h']}" if item["resume"] else "Watched"
             elif item["resume"]:
                 sub = f"Resume · {item['resume_h']}"
             else:
@@ -639,6 +691,13 @@ def build_payload():
             })
         if len(cont) >= 12:
             break
+
+    if newly_done:  # remember it even after VLC's 30-entry recents list forgets the file
+        with STATE_LOCK:
+            for lp in newly_done:
+                if lp in STATE["history"]:
+                    STATE["history"][lp]["finished"] = True
+            save_state(STATE)
 
     return {"folders": folders, "vlc": bool(find_vlc()), "continue": cont,
             "shows": out_shows, "movies": out_movies}
@@ -971,7 +1030,7 @@ class OpenShelf(tk.Tk):
         items = [c for c in p["continue"] if match(c["title"])]
         for c in items:
             play, alt, key = c["play"], c.get("alt"), c.get("key")
-            resuming = play["resume"] and not play.get("finished")
+            resuming = play["resume"] and not play.get("done")
             btn_label = "▶ Resume" if resuming else ("▶ Next" if alt else "▶ Play")
             if c["kind"] == "show":
                 btn_label += " " + play["label"]
@@ -992,14 +1051,14 @@ class OpenShelf(tk.Tk):
         shown = [s for s in p["shows"] if match(s["title"])]
         if hide_watched:
             shown = [s for s in shown
-                     if not all(e["played"] and (not e["resume"] or e["finished"]) for e in s["episodes"])]
+                     if not all(e["done"] for e in s["episodes"])]
         shown.sort(key=lambda s: s["title"].lower())
         if sort_recent:
             shown.sort(key=lambda s: s["last_played"], reverse=True)
         for s in shown:
             nxt = s["next"]
             badge = None
-            if nxt["resume"]:
+            if nxt["resume"] and not nxt["done"]:
                 badge = f"⏸ {nxt['label']} · {nxt['resume_h']}"
             elif s["last_played"]:
                 badge = f"Next: {nxt['label']}"
@@ -1031,7 +1090,7 @@ class OpenShelf(tk.Tk):
         self._controls_row(movies_tab.inner, sort_recent, hide_watched)
         mshown = [m for m in p["movies"] if match(m["title"])]
         if hide_watched:
-            mshown = [m for m in mshown if not (m["played"] and (not m["resume"] or m["finished"]))]
+            mshown = [m for m in mshown if not m["done"]]
         mshown.sort(key=lambda m: (m["title"].lower(), m["year"] or ""))
         if sort_recent:
             mshown.sort(key=lambda m: m["last_played"], reverse=True)
@@ -1041,12 +1100,12 @@ class OpenShelf(tk.Tk):
                 title += f" ({m['year']})"
             if m["tag"]:
                 title += f"  [{m['tag']}]"
-            done = m["played"] and (not m["resume"] or m["finished"])
+            done = m["done"]
             if done:
                 title += "  ✓"
             make_row(movies_tab.inner, title,
                      badge=f"⏸ {m['resume_h']}" if m["resume"] else None,
-                     buttons=[("▶ Resume" if m["resume"] else "▶ Play",
+                     buttons=[("▶ Resume" if m["resume"] and not m["done"] else "▶ Play",
                                lambda pl=m: self.play(pl), True)],
                      on_click=lambda pl=m: self.play(pl),
                      on_context=lambda e, mv=m: self._menu(e, [
@@ -1163,7 +1222,7 @@ class OpenShelf(tk.Tk):
                 season = ep["season"]
                 tk.Label(panel, text=f"SEASON {season}", bg=BG, fg=DIM,
                          font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
-            done = ep["played"] and (not ep["resume"] or ep["finished"])
+            done = ep["done"]
             badge = None
             if ep["resume"]:
                 badge = f"⏸ {ep['resume_h']}" + (" · finished" if ep["finished"] else "")
