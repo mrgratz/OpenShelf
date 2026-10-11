@@ -8,7 +8,7 @@ Run:  python app.py   (or the packaged OpenShelf.exe — see README)
 State: state.json next to this file. Nothing leaves the machine.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 import json
 import os
