@@ -516,6 +516,9 @@ def fmt_time(sec):
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+VLC_POLL_MS = 2000  # how often to check whether VLC saved new positions
+
+
 def _ini_mtime():
     try:
         return datetime.fromtimestamp(_vlc_ini_path().stat().st_mtime)
@@ -1003,6 +1006,8 @@ class OpenShelf(tk.Tk):
         self.bind("<FocusIn>", self._on_focus)
         dark_title_bar(self)
         self.refresh(force=True)
+        self._ini_seen = _ini_mtime()
+        self.after(VLC_POLL_MS, self._watch_vlc)
 
     # -- data --
 
@@ -1010,6 +1015,14 @@ class OpenShelf(tk.Tk):
         # coming back from VLC: re-read its saved positions (cheap; no disk rescan)
         if event.widget is self and time.time() - self._last_refresh > 5 and not self._busy:
             self.refresh()
+
+    def _watch_vlc(self):
+        # VLC saves positions the moment it closes; catch that without waiting for a click
+        m = _ini_mtime()
+        if m != self._ini_seen and not self._busy:
+            self._ini_seen = m
+            self.refresh()
+        self.after(VLC_POLL_MS, self._watch_vlc)
 
     def refresh(self, force=False):
         if self._busy:
